@@ -307,6 +307,7 @@ class indexTTS2Generate(io.ComfyNode):
                 io.Float.Input("length_penalty", default=0.0, min=-2.0, max=2.0, step=0.1),
                 io.Int.Input("max_mel_tokens", default=1815, min=50, max=1815, step=5),
                 io.Int.Input("max_tokens_per_sentence", default=120, min=0, max=600, step=5),
+                io.Float.Input("speech_speed", default=1.0, min=0.5, max=2.0, step=0.05, tooltip="Speech speed (0.5=slower, 1.0=normal, 2.0=faster)"),
                 io.Int.Input("seed", default=0, min=0, max=2 ** 32 - 1),
             ],
             outputs=[
@@ -318,7 +319,7 @@ class indexTTS2Generate(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, indextts_model, text: str, unload_model:bool, do_sample: bool, temperature: float, top_p: float, top_k: int, num_beams: int, repetition_penalty: float, length_penalty: float, max_mel_tokens: int, max_tokens_per_sentence: int, seed: int, reference_audio=None, reference_audios=None, emotions=None, unique_id=None) -> io.NodeOutput:
+    def execute(cls, indextts_model, text: str, unload_model:bool, do_sample: bool, temperature: float, top_p: float, top_k: int, num_beams: int, repetition_penalty: float, length_penalty: float, max_mel_tokens: int, max_tokens_per_sentence: int, speech_speed: float, seed: int, reference_audio=None, reference_audios=None, emotions=None, unique_id=None) -> io.NodeOutput:
         global fingerprint
         # 音频预处理
         if emotions is None and reference_audio is None and reference_audios is None:
@@ -468,6 +469,7 @@ class indexTTS2Generate(io.ComfyNode):
                     length_penalty=length_penalty,
                     max_mel_tokens=max_mel_tokens, 
                     max_tokens_per_sentence=max_tokens_per_sentence,
+                    speech_speed=speech_speed,
                     emo_text=emo_text_param, 
                     emo_ref_audio=emo_ref_audio_param, 
                     emo_vector=emo_vector_param, 
@@ -686,6 +688,7 @@ class indexTTS2Generate(io.ComfyNode):
                     length_penalty=length_penalty,
                     max_mel_tokens=max_mel_tokens, 
                     max_tokens_per_sentence=max_tokens_per_sentence,
+                    speech_speed=speech_speed,
                     emo_text=emo_text_param, 
                     emo_ref_audio=emo_ref_audio_param, 
                     emo_vector=emo_vector_param, 
@@ -756,6 +759,7 @@ class indexTTS2Generate(io.ComfyNode):
                 do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k, num_beams=num_beams,
                 repetition_penalty=repetition_penalty, length_penalty=length_penalty,
                 max_mel_tokens=max_mel_tokens, max_tokens_per_sentence=max_tokens_per_sentence,
+                speech_speed=speech_speed,
                 emo_text=None, emo_ref_audio=None, emo_vector=None, emo_weight=0.8,
                 seed=seed, return_subtitles=True, use_random=False)
             pbar.update(100)
@@ -810,6 +814,7 @@ class indexTTSGenerateSimple(io.ComfyNode):
             length_penalty=0.0,  # 默认值
             max_mel_tokens=1815,  # 默认值
             max_tokens_per_sentence=120,  # 默认值
+            speech_speed=1.0,  # 默认值
             seed=seed,
             reference_audio=reference_audio,
             reference_audios=reference_audios,

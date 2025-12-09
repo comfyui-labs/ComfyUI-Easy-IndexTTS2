@@ -73,6 +73,10 @@
       "max_tokens_per_sentence": {
         "name": "每句最大令牌"
       },
+      "speech_speed": {
+        "name": "语速",
+        "tooltip": "语音速度（0.8=较慢，1.0=正常，1.3=较快）"
+      },
       "seed": {
         "name": "随机种子"
       }

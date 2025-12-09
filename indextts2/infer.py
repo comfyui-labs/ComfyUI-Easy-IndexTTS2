@@ -19,6 +19,9 @@ class IndexTTS2Engine:
         self.tts = None
 
     def unload_model(self):
+        # Call the clean() method on the tts instance if available
+        if self.tts is not None and hasattr(self.tts, "clean"):
+            self.tts.clean()
         if self.loader and hasattr(self.loader, "_cache"):
             self.loader._cache.clear()
         self.tts = None
@@ -50,6 +53,7 @@ class IndexTTS2Engine:
         length_penalty: float = 0.0,
         max_mel_tokens: int = 1500,
         max_tokens_per_sentence: int = 120,
+        speech_speed: float = 1.0,
         # Emotion controls
         emotion_control_method: Optional[str] = None,
         emo_text: Optional[str] = None,
@@ -90,6 +94,7 @@ class IndexTTS2Engine:
             num_beams=int(num_beams),
             repetition_penalty=float(repetition_penalty),
             max_mel_tokens=int(_max_mel_tokens),
+            speech_speed=float(speech_speed),
         )
 
         # Emotion control selection
@@ -114,7 +119,7 @@ class IndexTTS2Engine:
             use_random=use_random,
             interval_silence=200,
             verbose=bool(verbose),
-            max_text_tokens_per_segment=int(max_tokens_per_sentence) if max_tokens_per_sentence else 120,
+            max_text_tokens_per_sentence=int(max_tokens_per_sentence) if max_tokens_per_sentence else 120,
             **gen_kwargs,
         )
 

@@ -507,6 +507,9 @@ class IndexTTS2:
         num_beams = generation_kwargs.pop("num_beams", 3)
         repetition_penalty = generation_kwargs.pop("repetition_penalty", 10.0)
         max_mel_tokens = generation_kwargs.pop("max_mel_tokens", 1500)
+        # Speech speed control: 0.5=slower, 1.0=normal, 2.0=faster
+        speech_speed = float(generation_kwargs.pop("speech_speed", 1.0))
+        speech_speed = max(0.5, min(2.0, speech_speed))  # Clamp to safe range
         # Allow overriding diffusion parameters via kwargs
         diffusion_steps = generation_kwargs.pop("diffusion_steps", 25)
         inference_cfg_rate = generation_kwargs.pop("inference_cfg_rate", 0.7)
@@ -625,7 +628,8 @@ class IndexTTS2:
                     S_infer = self.semantic_codec.quantizer.vq2emb(codes.unsqueeze(1))
                     S_infer = S_infer.transpose(1, 2)
                     S_infer = S_infer + latent
-                    target_lengths = (code_lens * 1.72).long()
+                    # Apply speech_speed: higher speed = shorter target_lengths
+                    target_lengths = (code_lens * 1.72 / speech_speed).long()
 
                     cond = self.s2mel.models['length_regulator'](S_infer,
                                                                  ylens=target_lengths,

@@ -72,6 +72,10 @@
       "max_tokens_per_sentence": {
         "name": "Max Tokens Per Sentence"
       },
+      "speech_speed": {
+        "name": "Speech Speed",
+        "tooltip": "Speech speed (0.8=slower, 1.0=normal, 1.3=faster)"
+      },
       "seed": {
         "name": "Seed"
       }

@@ -129,7 +129,7 @@ class IndexTTS2Loader:
                 )
 
         cfg_path = os.path.join(self._model_dir, "config.yaml")
-        # Upstream IndexTTS2 expects 'is_fp16' (HF demo), not 'use_fp16'
+        # Vendor IndexTTS2 uses 'is_fp16' parameter
         tts = IndexTTS2(
             cfg_path=cfg_path,
             model_dir=self._model_dir,
