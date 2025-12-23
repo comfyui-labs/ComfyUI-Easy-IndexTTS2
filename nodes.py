@@ -16,7 +16,7 @@ from comfy_api.latest import ComfyExtension, io
 from .indextts2.infer import IndexTTS2Engine
 from .indextts2.model_loader import IndexTTS2Loader
 
-from server import PromptServer
+# from server import PromptServer
 
 # 初始化模型加载器和引擎
 loader = IndexTTS2Loader()
@@ -62,7 +62,6 @@ def process_audio_input(audio: io.Audio) -> Tuple[np.ndarray, int]:
 
 # 下载并加载IndexTTS2模型节点
 class DownloadAndLoadIndexTTSModel(io.ComfyNode):
-    pass
 
     @classmethod
     def define_schema(cls):
@@ -131,12 +130,12 @@ class DownloadAndLoadIndexTTSModel(io.ComfyNode):
         except ImportError:
             raise Exception("modelscope not installed. Please run: pip install modelscope")
 
-    @classmethod
-    async def fingerprint_inputs(cls, model: str, download_from: str, start=None) -> str:
-        global fingerprint
-        # 构建基于输入参数的指纹
-        base_fingerprint = f"{model}_{download_from}"
-        return f"{base_fingerprint}_{str(fingerprint)}"
+    # @classmethod
+    # async def fingerprint_inputs(cls, model: str, download_from: str, start=None) -> str:
+    #     global fingerprint
+    #     # 构建基于输入参数的指纹
+    #     base_fingerprint = f"{model}_{download_from}"
+    #     return f"{base_fingerprint}_{str(fingerprint)}"
 
     @classmethod
     def execute(cls, model: str, download_from: str, start: io.AnyType = None) -> io.NodeOutput:
@@ -282,7 +281,7 @@ class DownloadAndLoadIndexTTSModel(io.ComfyNode):
         except yaml.YAMLError:
             raise Exception("Error parsing config.yaml. Please check the YAML syntax.")
         except Exception as e:
-            raise Exception(f"Download failed: {str(e)}")
+            raise Exception(f"Load failed: {str(e)}")
 # 语音节点
 class indexTTS2Generate(io.ComfyNode):
     @classmethod
@@ -320,7 +319,9 @@ class indexTTS2Generate(io.ComfyNode):
 
     @classmethod
     def execute(cls, indextts_model, text: str, unload_model:bool, do_sample: bool, temperature: float, top_p: float, top_k: int, num_beams: int, repetition_penalty: float, length_penalty: float, max_mel_tokens: int, max_tokens_per_sentence: int, speech_speed: float, seed: int, reference_audio=None, reference_audios=None, emotions=None, unique_id=None) -> io.NodeOutput:
-        global fingerprint
+        if engine.tts is None:
+            engine.tts = engine.loader.get_tts()
+
         # 音频预处理
         if emotions is None and reference_audio is None and reference_audios is None:
             raise ValueError("Please provide either emotions or reference_audio for voice cloning.")
@@ -470,7 +471,7 @@ class indexTTS2Generate(io.ComfyNode):
                     max_mel_tokens=max_mel_tokens, 
                     max_tokens_per_sentence=max_tokens_per_sentence,
                     speech_speed=speech_speed,
-                    emo_text=emo_text_param, 
+                    emo_text=emo_text_param,
                     emo_ref_audio=emo_ref_audio_param, 
                     emo_vector=emo_vector_param, 
                     emo_weight=emo_weight_param,
@@ -528,7 +529,7 @@ class indexTTS2Generate(io.ComfyNode):
             # 卸载模型
             if unload_model:
                 indextts_model.unload_model()
-                fingerprint = random.randrange(100000, 999999)
+                engine.tts = None
 
             return io.NodeOutput(audio, seed, final_subtitle)
         elif reference_audios is not None and len(reference_audios) > 0:
@@ -689,7 +690,7 @@ class indexTTS2Generate(io.ComfyNode):
                     max_mel_tokens=max_mel_tokens, 
                     max_tokens_per_sentence=max_tokens_per_sentence,
                     speech_speed=speech_speed,
-                    emo_text=emo_text_param, 
+                    emo_text=emo_text_param,
                     emo_ref_audio=emo_ref_audio_param, 
                     emo_vector=emo_vector_param, 
                     emo_weight=emo_weight_param,
@@ -747,7 +748,7 @@ class indexTTS2Generate(io.ComfyNode):
             # 卸载模型
             if unload_model:
                 indextts_model.unload_model()
-                fingerprint = random.randrange(100000, 999999)
+                engine.tts = None
 
             return io.NodeOutput(audio, seed, final_subtitle)
         else:
@@ -769,7 +770,7 @@ class indexTTS2Generate(io.ComfyNode):
             # 卸载模型
             if unload_model:
                 indextts_model.unload_model()
-                fingerprint = random.randrange(100000, 999999)
+                engine.tts = None
 
             return io.NodeOutput(audio, seed, (sub or ""))
 
