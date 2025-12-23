@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import gc
 import json
+import threading
 import hashlib
 import comfy.model_management as mm
 import comfy.utils
@@ -16,12 +17,13 @@ from comfy_api.latest import ComfyExtension, io
 from .indextts2.infer import IndexTTS2Engine
 from .indextts2.model_loader import IndexTTS2Loader
 
-# from server import PromptServer
+from server import PromptServer
 
 # 初始化模型加载器和引擎
 loader = IndexTTS2Loader()
 engine = IndexTTS2Engine(loader)
 fingerprint = 1
+_ENGINE_LOCK = threading.RLock()
 
 # 定义自定义类型
 TYPE_Audios = io.Custom(io_type="AUDIOS")
@@ -60,8 +62,22 @@ def process_audio_input(audio: io.Audio) -> Tuple[np.ndarray, int]:
     else:
         raise ValueError("AUDIO input must be ComfyUI dict or (wave, sr)")
 
+
+def _ensure_engine_loaded(indextts_model: IndexTTS2Engine) -> None:
+    if indextts_model.tts is None:
+        indextts_model.tts = indextts_model.loader.get_tts()
+        indextts_model.register_with_mm()
+
+
+def _unload_if_requested(indextts_model: IndexTTS2Engine, unload_model: bool) -> None:
+    global fingerprint
+    if unload_model:
+        indextts_model.unload_model()
+        fingerprint = random.randrange(100000, 999999)
+
 # 下载并加载IndexTTS2模型节点
 class DownloadAndLoadIndexTTSModel(io.ComfyNode):
+    pass
 
     @classmethod
     def define_schema(cls):
@@ -130,12 +146,12 @@ class DownloadAndLoadIndexTTSModel(io.ComfyNode):
         except ImportError:
             raise Exception("modelscope not installed. Please run: pip install modelscope")
 
-    # @classmethod
-    # async def fingerprint_inputs(cls, model: str, download_from: str, start=None) -> str:
-    #     global fingerprint
-    #     # 构建基于输入参数的指纹
-    #     base_fingerprint = f"{model}_{download_from}"
-    #     return f"{base_fingerprint}_{str(fingerprint)}"
+    @classmethod
+    async def fingerprint_inputs(cls, model: str, download_from: str, start=None) -> str:
+        global fingerprint
+        # 构建基于输入参数的指纹
+        base_fingerprint = f"{model}_{download_from}"
+        return f"{base_fingerprint}_{str(fingerprint)}"
 
     @classmethod
     def execute(cls, model: str, download_from: str, start: io.AnyType = None) -> io.NodeOutput:
@@ -273,6 +289,7 @@ class DownloadAndLoadIndexTTSModel(io.ComfyNode):
 
             # 加载模型
             engine.tts = engine.loader.get_tts()
+            engine.register_with_mm()
             # PromptServer.instance.send_progress_text(
             #     f"{model} loaded successfully.",
             #     cls.hidden.unique_id
@@ -281,7 +298,7 @@ class DownloadAndLoadIndexTTSModel(io.ComfyNode):
         except yaml.YAMLError:
             raise Exception("Error parsing config.yaml. Please check the YAML syntax.")
         except Exception as e:
-            raise Exception(f"Load failed: {str(e)}")
+            raise Exception(f"Download failed: {str(e)}")
 # 语音节点
 class indexTTS2Generate(io.ComfyNode):
     @classmethod
@@ -319,9 +336,7 @@ class indexTTS2Generate(io.ComfyNode):
 
     @classmethod
     def execute(cls, indextts_model, text: str, unload_model:bool, do_sample: bool, temperature: float, top_p: float, top_k: int, num_beams: int, repetition_penalty: float, length_penalty: float, max_mel_tokens: int, max_tokens_per_sentence: int, speech_speed: float, seed: int, reference_audio=None, reference_audios=None, emotions=None, unique_id=None) -> io.NodeOutput:
-        if engine.tts is None:
-            engine.tts = engine.loader.get_tts()
-
+        global fingerprint
         # 音频预处理
         if emotions is None and reference_audio is None and reference_audios is None:
             raise ValueError("Please provide either emotions or reference_audio for voice cloning.")
@@ -399,124 +414,126 @@ class indexTTS2Generate(io.ComfyNode):
             # 初始化进度条
             pbar = comfy.utils.ProgressBar(len(segments))
             
-            for segment_idx, segment in enumerate(segments):
-                if len(segment) == 2 and segment[0] == "__PAUSE__":
-                    # 处理停顿
-                    pause_duration = segment[1]
-                    # 如果还没有采样率信息，使用默认值22050
-                    sample_rate = current_sr if current_sr is not None else 22050
-                    silence_samples = int(pause_duration * sample_rate)
-                    silence_wave = np.zeros(silence_samples, dtype=np.float32)
-                    all_waves.append(silence_wave)
+            with _ENGINE_LOCK:
+                _ensure_engine_loaded(indextts_model)
+                for segment_idx, segment in enumerate(segments):
+                    if len(segment) == 2 and segment[0] == "__PAUSE__":
+                        # 处理停顿
+                        pause_duration = segment[1]
+                        # 如果还没有采样率信息，使用默认值22050
+                        sample_rate = current_sr if current_sr is not None else 22050
+                        silence_samples = int(pause_duration * sample_rate)
+                        silence_wave = np.zeros(silence_samples, dtype=np.float32)
+                        all_waves.append(silence_wave)
+                        
+                        # 添加停顿字幕
+                        all_subtitles.append({
+                            "id": "pause",
+                            "字幕": f"[停顿 {pause_duration}秒]",
+                            "start": round(current_time, 2),
+                            "end": round(current_time + pause_duration, 2)
+                        })
+                        
+                        current_time += pause_duration
+                        continue
                     
-                    # 添加停顿字幕
-                    all_subtitles.append({
-                        "id": "pause",
-                        "字幕": f"[停顿 {pause_duration}秒]",
-                        "start": round(current_time, 2),
-                        "end": round(current_time + pause_duration, 2)
-                    })
+                    vc_name, segment_text = segment
+                    # 查找对应的音色情感配置
+                    if vc_name not in voice_map:
+                        # 如果音色名不存在，使用第一个可用音色
+                        vc_name = voice_order[0] if voice_order else "s1"
                     
-                    current_time += pause_duration
-                    continue
-                
-                vc_name, segment_text = segment
-                # 查找对应的音色情感配置
-                if vc_name not in voice_map:
-                    # 如果音色名不存在，使用第一个可用音色
-                    vc_name = voice_order[0] if voice_order else "s1"
-                
-                emotion_data = voice_map[vc_name]
-                # 检查是否已经处理过该音色的参考音频
-                if vc_name not in processed_ref_audios:
-                    processed_ref_audios[vc_name] = process_audio_input(emotion_data["reference_audio"])
-                ref_audio = processed_ref_audios[vc_name]
-                
-                emo_mode = emotion_data.get("emo_mode", EMOTION_MODE.SAME_AS_REF)
-                
-                # 根据情感模式设置参数
-                emo_text_param = None
-                emo_ref_audio_param = None
-                emo_vector_param = None
-                use_qwen = False
-                emo_weight_param = 0.8
-                use_random_param = emotion_data.get("use_random", False)
-                
-                if emo_mode == EMOTION_MODE.EMO_TEXT:
-                    emo_text_param = emotion_data.get("description", "")
-                    use_qwen = True
-                elif emo_mode == EMOTION_MODE.EMO_AUDIO:
-                    # 检查是否已经处理过该音色的情感参考音频
-                    emo_audio_key = f"{vc_name}_emo"
-                    if emo_audio_key not in processed_emo_audios and "emo_ref_audio" in emotion_data:
-                        processed_emo_audios[emo_audio_key] = emotion_data.get("emo_ref_audio")
-                    emo_ref_audio_param = processed_emo_audios.get(emo_audio_key)
-                    emo_weight_param = emotion_data.get("emo_weight", 0.8)
-                elif emo_mode == EMOTION_MODE.EMO_VECTOR:
-                    emo_vector_param = emotion_data.get("emo_vector")
+                    emotion_data = voice_map[vc_name]
+                    # 检查是否已经处理过该音色的参考音频
+                    if vc_name not in processed_ref_audios:
+                        processed_ref_audios[vc_name] = process_audio_input(emotion_data["reference_audio"])
+                    ref_audio = processed_ref_audios[vc_name]
+                    
+                    emo_mode = emotion_data.get("emo_mode", EMOTION_MODE.SAME_AS_REF)
+                    
+                    # 根据情感模式设置参数
+                    emo_text_param = None
+                    emo_ref_audio_param = None
+                    emo_vector_param = None
+                    use_qwen = False
+                    emo_weight_param = 0.8
+                    use_random_param = emotion_data.get("use_random", False)
+                    
+                    if emo_mode == EMOTION_MODE.EMO_TEXT:
+                        emo_text_param = emotion_data.get("description", "")
+                        use_qwen = True
+                    elif emo_mode == EMOTION_MODE.EMO_AUDIO:
+                        # 检查是否已经处理过该音色的情感参考音频
+                        emo_audio_key = f"{vc_name}_emo"
+                        if emo_audio_key not in processed_emo_audios and "emo_ref_audio" in emotion_data:
+                            processed_emo_audios[emo_audio_key] = emotion_data.get("emo_ref_audio")
+                        emo_ref_audio_param = processed_emo_audios.get(emo_audio_key)
+                        emo_weight_param = emotion_data.get("emo_weight", 0.8)
+                    elif emo_mode == EMOTION_MODE.EMO_VECTOR:
+                        emo_vector_param = emotion_data.get("emo_vector")
 
-                print(f"Generating for voice: {vc_name}, Text: {segment_text[:30]}..., EmoMode: {emo_mode}, emo_text_param: {emo_text_param}")
-                # 生成单个片段的音频
-                sr, wave, sub = indextts_model.generate(
-                    text=segment_text, 
-                    reference_audio=ref_audio, 
-                    mode="Auto",
-                    do_sample=do_sample, 
-                    temperature=temperature, 
-                    top_p=top_p, 
-                    top_k=top_k, 
-                    num_beams=num_beams,
-                    repetition_penalty=repetition_penalty, 
-                    length_penalty=length_penalty,
-                    max_mel_tokens=max_mel_tokens, 
-                    max_tokens_per_sentence=max_tokens_per_sentence,
-                    speech_speed=speech_speed,
-                    emo_text=emo_text_param,
-                    emo_ref_audio=emo_ref_audio_param, 
-                    emo_vector=emo_vector_param, 
-                    emo_weight=emo_weight_param,
-                    seed=seed, 
-                    return_subtitles=True, 
-                    use_random=use_random_param,
-                    use_qwen=use_qwen
-                )
-                
-                # 更新当前采样率
-                if current_sr is None:
-                    current_sr = sr
-                
-                all_waves.append(wave)
-                
-                # 计算片段时长并更新字幕时间
-                segment_duration = len(wave) / float(sr)
-                if sub:
-                    try:
-                        sub_data = json.loads(sub)
-                        for item in sub_data:
-                            item["id"] = vc_name
-                            item["start"] = round(current_time + item.get("start", 0), 2)
-                            item["end"] = round(current_time + item.get("end", segment_duration), 2)
-                        all_subtitles.extend(sub_data)
-                    except:
-                        # 如果解析失败，创建简单字幕
+                    print(f"Generating for voice: {vc_name}, Text: {segment_text[:30]}..., EmoMode: {emo_mode}, emo_text_param: {emo_text_param}")
+                    # 生成单个片段的音频
+                    sr, wave, sub = indextts_model.generate(
+                        text=segment_text, 
+                        reference_audio=ref_audio, 
+                        mode="Auto",
+                        do_sample=do_sample, 
+                        temperature=temperature, 
+                        top_p=top_p, 
+                        top_k=top_k, 
+                        num_beams=num_beams,
+                        repetition_penalty=repetition_penalty, 
+                        length_penalty=length_penalty,
+                        max_mel_tokens=max_mel_tokens, 
+                        max_tokens_per_sentence=max_tokens_per_sentence,
+                        speech_speed=speech_speed,
+                        emo_text=emo_text_param, 
+                        emo_ref_audio=emo_ref_audio_param, 
+                        emo_vector=emo_vector_param, 
+                        emo_weight=emo_weight_param,
+                        seed=seed, 
+                        return_subtitles=True, 
+                        use_random=use_random_param,
+                        use_qwen=use_qwen
+                    )
+                    
+                    # 更新当前采样率
+                    if current_sr is None:
+                        current_sr = sr
+                    
+                    all_waves.append(wave)
+                    
+                    # 计算片段时长并更新字幕时间
+                    segment_duration = len(wave) / float(sr)
+                    if sub:
+                        try:
+                            sub_data = json.loads(sub)
+                            for item in sub_data:
+                                item["id"] = vc_name
+                                item["start"] = round(current_time + item.get("start", 0), 2)
+                                item["end"] = round(current_time + item.get("end", segment_duration), 2)
+                            all_subtitles.extend(sub_data)
+                        except:
+                            # 如果解析失败，创建简单字幕
+                            all_subtitles.append({
+                                "id": vc_name,
+                                "字幕": segment_text,
+                                "start": round(current_time, 2),
+                                "end": round(current_time + segment_duration, 2)
+                            })
+                    else:
                         all_subtitles.append({
                             "id": vc_name,
                             "字幕": segment_text,
                             "start": round(current_time, 2),
                             "end": round(current_time + segment_duration, 2)
                         })
-                else:
-                    all_subtitles.append({
-                        "id": vc_name,
-                        "字幕": segment_text,
-                        "start": round(current_time, 2),
-                        "end": round(current_time + segment_duration, 2)
-                    })
-                
-                current_time += segment_duration
-                
-                # 更新进度条
-                pbar.update(1)
+                    
+                    current_time += segment_duration
+                    
+                    # 更新进度条
+                    pbar.update(1)
             
             # 连接所有音频片段
             final_wave = np.concatenate(all_waves) if all_waves else np.array([])
@@ -527,9 +544,8 @@ class indexTTS2Generate(io.ComfyNode):
             final_subtitle = json.dumps(all_subtitles, ensure_ascii=False) if all_subtitles else ""
 
             # 卸载模型
-            if unload_model:
-                indextts_model.unload_model()
-                engine.tts = None
+            with _ENGINE_LOCK:
+                _unload_if_requested(indextts_model, unload_model)
 
             return io.NodeOutput(audio, seed, final_subtitle)
         elif reference_audios is not None and len(reference_audios) > 0:
@@ -629,113 +645,115 @@ class indexTTS2Generate(io.ComfyNode):
             # 初始化进度条
             pbar = comfy.utils.ProgressBar(len(segments))
             
-            for segment_idx, segment in enumerate(segments):
-                if len(segment) == 2 and segment[0] == "__PAUSE__":
-                    # 处理停顿
-                    pause_duration = segment[1]
-                    # 如果还没有采样率信息，使用默认值22050
-                    sample_rate = current_sr if current_sr is not None else 22050
-                    silence_samples = int(pause_duration * sample_rate)
-                    silence_wave = np.zeros(silence_samples, dtype=np.float32)
-                    all_waves.append(silence_wave)
+            with _ENGINE_LOCK:
+                _ensure_engine_loaded(indextts_model)
+                for segment_idx, segment in enumerate(segments):
+                    if len(segment) == 2 and segment[0] == "__PAUSE__":
+                        # 处理停顿
+                        pause_duration = segment[1]
+                        # 如果还没有采样率信息，使用默认值22050
+                        sample_rate = current_sr if current_sr is not None else 22050
+                        silence_samples = int(pause_duration * sample_rate)
+                        silence_wave = np.zeros(silence_samples, dtype=np.float32)
+                        all_waves.append(silence_wave)
+                        
+                        # 添加停顿字幕
+                        all_subtitles.append({
+                            "id": "pause",
+                            "字幕": f"[停顿 {pause_duration}秒]",
+                            "start": round(current_time, 2),
+                            "end": round(current_time + pause_duration, 2)
+                        })
+                        
+                        current_time += pause_duration
+                        continue
                     
-                    # 添加停顿字幕
-                    all_subtitles.append({
-                        "id": "pause",
-                        "字幕": f"[停顿 {pause_duration}秒]",
-                        "start": round(current_time, 2),
-                        "end": round(current_time + pause_duration, 2)
-                    })
+                    char_index, vc_name, segment_text, emo_mode, emo_vector, emo_text = segment
+                    # 检查是否已经处理过该音色的参考音频
+                    if char_index not in processed_ref_audios:
+                        processed_ref_audios[char_index] = process_audio_input(reference_audios[char_index])
+                    ref_audio = processed_ref_audios[char_index]
                     
-                    current_time += pause_duration
-                    continue
-                
-                char_index, vc_name, segment_text, emo_mode, emo_vector, emo_text = segment
-                # 检查是否已经处理过该音色的参考音频
-                if char_index not in processed_ref_audios:
-                    processed_ref_audios[char_index] = process_audio_input(reference_audios[char_index])
-                ref_audio = processed_ref_audios[char_index]
-                
-                # 调试信息：确认音频对应关系
-                # print(f"Using voice {vc_name} (index {char_index}) for text: {segment_text[:30]}...")
-                # print(f"Reference audio shape: {ref_audio[0].shape if isinstance(ref_audio, tuple) else 'N/A'}, Sample rate: {ref_audio[1] if isinstance(ref_audio, tuple) else 'N/A'}")
-                
-                # 根据情感模式设置参数
-                emo_text_param = None
-                emo_ref_audio_param = None
-                emo_vector_param = None
-                use_qwen = False
-                emo_weight_param = 0.8
-                use_random_param = False
-                
-                if emo_mode == EMOTION_MODE.EMO_TEXT:
-                    emo_text_param = emo_text
-                    use_qwen = True
-                elif emo_mode == EMOTION_MODE.EMO_VECTOR:
-                    emo_vector_param = emo_vector
-                
-                # print(f"Generating for voice: {vc_name}, Text: {segment_text[:30]}..., EmoMode: {emo_mode}, emo_text_param: {emo_text_param}")
-                # 生成单个片段的音频
-                sr, wave, sub = indextts_model.generate(
-                    text=segment_text, 
-                    reference_audio=ref_audio, 
-                    mode="Auto",
-                    do_sample=do_sample, 
-                    temperature=temperature, 
-                    top_p=top_p, 
-                    top_k=top_k, 
-                    num_beams=num_beams,
-                    repetition_penalty=repetition_penalty, 
-                    length_penalty=length_penalty,
-                    max_mel_tokens=max_mel_tokens, 
-                    max_tokens_per_sentence=max_tokens_per_sentence,
-                    speech_speed=speech_speed,
-                    emo_text=emo_text_param,
-                    emo_ref_audio=emo_ref_audio_param, 
-                    emo_vector=emo_vector_param, 
-                    emo_weight=emo_weight_param,
-                    seed=seed, 
-                    return_subtitles=True, 
-                    use_random=use_random_param,
-                    use_qwen=use_qwen
-                )
-                
-                # 更新当前采样率
-                if current_sr is None:
-                    current_sr = sr
-                
-                all_waves.append(wave)
-                
-                # 计算片段时长并更新字幕时间
-                segment_duration = len(wave) / float(sr)
-                if sub:
-                    try:
-                        sub_data = json.loads(sub)
-                        for item in sub_data:
-                            item["id"] = vc_name
-                            item["start"] = round(current_time + item.get("start", 0), 2)
-                            item["end"] = round(current_time + item.get("end", segment_duration), 2)
-                        all_subtitles.extend(sub_data)
-                    except:
-                        # 如果解析失败，创建简单字幕
+                    # 调试信息：确认音频对应关系
+                    # print(f"Using voice {vc_name} (index {char_index}) for text: {segment_text[:30]}...")
+                    # print(f"Reference audio shape: {ref_audio[0].shape if isinstance(ref_audio, tuple) else 'N/A'}, Sample rate: {ref_audio[1] if isinstance(ref_audio, tuple) else 'N/A'}")
+                    
+                    # 根据情感模式设置参数
+                    emo_text_param = None
+                    emo_ref_audio_param = None
+                    emo_vector_param = None
+                    use_qwen = False
+                    emo_weight_param = 0.8
+                    use_random_param = False
+                    
+                    if emo_mode == EMOTION_MODE.EMO_TEXT:
+                        emo_text_param = emo_text
+                        use_qwen = True
+                    elif emo_mode == EMOTION_MODE.EMO_VECTOR:
+                        emo_vector_param = emo_vector
+                    
+                    # print(f"Generating for voice: {vc_name}, Text: {segment_text[:30]}..., EmoMode: {emo_mode}, emo_text_param: {emo_text_param}")
+                    # 生成单个片段的音频
+                    sr, wave, sub = indextts_model.generate(
+                        text=segment_text, 
+                        reference_audio=ref_audio, 
+                        mode="Auto",
+                        do_sample=do_sample, 
+                        temperature=temperature, 
+                        top_p=top_p, 
+                        top_k=top_k, 
+                        num_beams=num_beams,
+                        repetition_penalty=repetition_penalty, 
+                        length_penalty=length_penalty,
+                        max_mel_tokens=max_mel_tokens, 
+                        max_tokens_per_sentence=max_tokens_per_sentence,
+                        speech_speed=speech_speed,
+                        emo_text=emo_text_param, 
+                        emo_ref_audio=emo_ref_audio_param, 
+                        emo_vector=emo_vector_param, 
+                        emo_weight=emo_weight_param,
+                        seed=seed, 
+                        return_subtitles=True, 
+                        use_random=use_random_param,
+                        use_qwen=use_qwen
+                    )
+                    
+                    # 更新当前采样率
+                    if current_sr is None:
+                        current_sr = sr
+                    
+                    all_waves.append(wave)
+                    
+                    # 计算片段时长并更新字幕时间
+                    segment_duration = len(wave) / float(sr)
+                    if sub:
+                        try:
+                            sub_data = json.loads(sub)
+                            for item in sub_data:
+                                item["id"] = vc_name
+                                item["start"] = round(current_time + item.get("start", 0), 2)
+                                item["end"] = round(current_time + item.get("end", segment_duration), 2)
+                            all_subtitles.extend(sub_data)
+                        except:
+                            # 如果解析失败，创建简单字幕
+                            all_subtitles.append({
+                                "id": vc_name,
+                                "字幕": segment_text,
+                                "start": round(current_time, 2),
+                                "end": round(current_time + segment_duration, 2)
+                            })
+                    else:
                         all_subtitles.append({
                             "id": vc_name,
                             "字幕": segment_text,
                             "start": round(current_time, 2),
                             "end": round(current_time + segment_duration, 2)
                         })
-                else:
-                    all_subtitles.append({
-                        "id": vc_name,
-                        "字幕": segment_text,
-                        "start": round(current_time, 2),
-                        "end": round(current_time + segment_duration, 2)
-                    })
-                
-                current_time += segment_duration
-                
-                # 更新进度条
-                pbar.update(1)
+                    
+                    current_time += segment_duration
+                    
+                    # 更新进度条
+                    pbar.update(1)
             
             # 连接所有音频片段
             final_wave = np.concatenate(all_waves) if all_waves else np.array([])
@@ -746,9 +764,8 @@ class indexTTS2Generate(io.ComfyNode):
             final_subtitle = json.dumps(all_subtitles, ensure_ascii=False) if all_subtitles else ""
 
             # 卸载模型
-            if unload_model:
-                indextts_model.unload_model()
-                engine.tts = None
+            with _ENGINE_LOCK:
+                _unload_if_requested(indextts_model, unload_model)
 
             return io.NodeOutput(audio, seed, final_subtitle)
         else:
@@ -756,21 +773,24 @@ class indexTTS2Generate(io.ComfyNode):
             pbar = comfy.utils.ProgressBar(100)
             ref = process_audio_input(reference_audio)
             pbar.update(10)
-            sr, wave, sub = indextts_model.generate(text=text, reference_audio=ref, mode="Auto",
-                do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k, num_beams=num_beams,
-                repetition_penalty=repetition_penalty, length_penalty=length_penalty,
-                max_mel_tokens=max_mel_tokens, max_tokens_per_sentence=max_tokens_per_sentence,
-                speech_speed=speech_speed,
-                emo_text=None, emo_ref_audio=None, emo_vector=None, emo_weight=0.8,
-                seed=seed, return_subtitles=True, use_random=False)
+            with _ENGINE_LOCK:
+                _ensure_engine_loaded(indextts_model)
+                sr, wave, sub = indextts_model.generate(
+                    text=text, reference_audio=ref, mode="Auto",
+                    do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k, num_beams=num_beams,
+                    repetition_penalty=repetition_penalty, length_penalty=length_penalty,
+                    max_mel_tokens=max_mel_tokens, max_tokens_per_sentence=max_tokens_per_sentence,
+                    speech_speed=speech_speed,
+                    emo_text=None, emo_ref_audio=None, emo_vector=None, emo_weight=0.8,
+                    seed=seed, return_subtitles=True, use_random=False
+                )
             pbar.update(100)
             wave_t = torch.tensor(wave, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
             audio = {"waveform": wave_t, "sample_rate": int(sr)}
 
             # 卸载模型
-            if unload_model:
-                indextts_model.unload_model()
-                engine.tts = None
+            with _ENGINE_LOCK:
+                _unload_if_requested(indextts_model, unload_model)
 
             return io.NodeOutput(audio, seed, (sub or ""))
 

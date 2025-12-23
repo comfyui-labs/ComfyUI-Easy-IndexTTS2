@@ -1,6 +1,7 @@
 import json
 import numpy as np
 import torch
+import comfy.model_management as mm
 from typing import Optional, Tuple
 
 from .model_loader import IndexTTS2Loader
@@ -17,15 +18,43 @@ class IndexTTS2Engine:
     def __init__(self, loader: Optional[IndexTTS2Loader] = None):
         self.loader = loader or IndexTTS2Loader()
         self.tts = None
+        self._mm_adapter = None
 
-    def unload_model(self):
+    def register_with_mm(self):
+        """Register the loaded TTS into Comfy's model manager for unified cleanup."""
+        if self.tts is None:
+            return
+
+        # Avoid duplicate registrations
+        if self._mm_adapter is not None and self._mm_adapter in mm.current_loaded_models:
+            # mark as loaded again
+            self._mm_adapter.model._loaded = True
+            return
+
+        size_bytes = self._estimate_model_size(self.tts)
+        adapter = IndexTTS2MMAdapter(self, size_bytes)
+        self._mm_adapter = mm.LoadedModel(adapter)
+
+        try:
+            mm.current_loaded_models.insert(0, self._mm_adapter)
+        except Exception:
+            self._mm_adapter = None
+
+    def unload_model(self, remove_from_mm: bool = True):
         # Call the clean() method on the tts instance if available
         if self.tts is not None and hasattr(self.tts, "clean"):
             self.tts.clean()
         if self.loader and hasattr(self.loader, "_cache"):
             self.loader._cache.clear()
         self.tts = None
-        torch.cuda.empty_cache()
+        if remove_from_mm and self._mm_adapter is not None:
+            try:
+                if self._mm_adapter in mm.current_loaded_models:
+                    mm.current_loaded_models.remove(self._mm_adapter)
+            except Exception:
+                pass
+            self._mm_adapter = None
+        mm.soft_empty_cache()
 
     def _estimate_tokens_from_duration(self, seconds: float) -> int:
         # Rough heuristic: 1s speech ~= 75 mel tokens (tunable). Clamp to 50..3000
@@ -66,7 +95,10 @@ class IndexTTS2Engine:
         return_subtitles: bool = True,
         use_random: bool = False,
     ) -> Tuple[int, np.ndarray, Optional[str]]:
-        # Ensure model is available
+        # Ensure model is available (support reload after mm unload)
+        if self.tts is None:
+            self.tts = self.loader.get_tts()
+            self.register_with_mm()
         tts = self.tts
 
         if reference_audio is None:
@@ -143,3 +175,74 @@ class IndexTTS2Engine:
             ], ensure_ascii=False)
 
         return int(sr), wav, subtitle
+
+
+class IndexTTS2MMAdapter:
+    """Minimal adapter so IndexTTS2 can be tracked by comfy.model_management."""
+
+    def __init__(self, engine: IndexTTS2Engine, bytes_size: int):
+        self.engine = engine
+        self.parent = None
+        self.load_device = mm.get_torch_device()
+        self.offload_device = torch.device("cpu")
+        self._size = int(bytes_size)
+        self._loaded = True
+
+    # --- API expected by comfy.model_management.LoadedModel ---
+    def model_size(self):
+        return self._size
+
+    def loaded_size(self):
+        return self._size if self._loaded else 0
+
+    def model_offloaded_memory(self):
+        return self.model_size() - self.loaded_size()
+
+    def model_dtype(self):
+        return torch.float16 if self.load_device.type == "cuda" else torch.float32
+
+    def current_loaded_device(self):
+        return self.load_device if self._loaded else self.offload_device
+
+    def partially_load(self, device, extra_memory, force_patch_weights=False):
+        self._loaded = True
+        if self.engine.tts is None:
+            self.engine.tts = self.engine.loader.get_tts()
+            self.engine.register_with_mm()
+        return self.loaded_size()
+
+    def partially_unload(self, device, target_free):
+        if self._loaded:
+            self.engine.unload_model(remove_from_mm=False)
+            self._loaded = False
+        return self._size
+
+    def detach(self, unpatch_weights=True):
+        return self.partially_unload(self.offload_device, None)
+
+    def model_patches_models(self):
+        return []
+
+    def model_patches_to(self, target):
+        return None
+
+    def lowvram_patch_counter(self):
+        return 0
+
+    def is_clone(self, other):
+        return False
+
+
+def _estimate_model_size(model) -> int:
+    try:
+        total = 0
+        state = model.state_dict()
+        for t in state.values():
+            total += t.numel() * t.element_size()
+        return int(total)
+    except Exception:
+        return int(3.5 * 1024 * 1024 * 1024)
+
+
+# Attach helper to the engine class
+IndexTTS2Engine._estimate_model_size = staticmethod(_estimate_model_size)
